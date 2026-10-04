@@ -1,13 +1,20 @@
 """Stick Light Fix: keep the joystick RGB rings off.
 
-The rings are a multicolor LED class device of hid_asus_ally. After a reboot
-the controller comes up with its default (blue, full brightness), and nothing
-on SteamOS restores a previous setting. Writing brightness 0 through the LED
-class keeps the rings dark across suspend (unlike turning them "off" together
-with mcu_powersave, which lets the MCU reset them in sleep), so the fix writes
-a static blue at brightness 0 once when the plugin starts, and again when the
-LED device (re)appears. After resume it only checks, and writes only if the
-rings are lit: a redundant write makes them flash.
+The rings are a multicolor LED class device of hid_asus_ally. Whenever the
+driver initialises the controller it forces the MCU's base brightness to a
+visible level (`5A BA C5 C4 02`), and the rings light up in the MCU's stored
+colour (blue) until colours are sent. That happens at boot, and after every
+resume: the kernel sets mcu_powersave=1 at boot, so the MCU loses power in
+sleep and is re-initialised a few seconds after wake. The driver's own restore
+goes out at resume time, before the MCU is back, and is lost.
+
+The fix writes a static blue at brightness 0 when the plugin starts and when
+the LED device (re)appears. After resume it repeats the write as a dense series
+for a while, so the rings go dark again within a fraction of a second of the
+MCU coming back; a short flash cannot be avoided without keeping the MCU
+powered (mcu_powersave=0), which is left to the user. The LED class
+`brightness` is the kernel's cached value, not the controller's: it reads 0 even
+while the rings are lit, so the series is sent unconditionally.
 """
 
 from __future__ import annotations
@@ -26,8 +33,9 @@ LED_PATH = "/sys/class/leds/ally:rgb:joystick_rings"
 LED_GLOB = "/sys/class/leds/*joystick_rings*"
 ZONES = 4
 COLOR = 0x0000FF  # blue, packed 0xRRGGBB per zone
-RESUME_DELAY_S = 3.0
-ADD_DELAY_S = 1.0
+SERIES_TICK_S = 0.3
+SERIES_DENSE_S = 10.0
+SERIES_TAIL_S = (12.0, 15.0)  # the MCU can come back late, as the Vibration Fix sees
 
 
 def _led_dir() -> str | None:
@@ -84,7 +92,7 @@ class StickLightsFix(Fix):
         }
 
     async def on_resume(self) -> None:
-        self._schedule("resume", RESUME_DELAY_S)
+        self._schedule("resume")
 
     async def start_background(self) -> None:
         if self._uevent is not None:
@@ -102,20 +110,43 @@ class StickLightsFix(Fix):
             return
         if "joystick_rings" not in event.get("DEVPATH", ""):
             return
-        self._schedule("led add", ADD_DELAY_S)
+        self._schedule("led add")
 
-    def _schedule(self, reason: str, delay: float) -> None:
+    def _schedule(self, reason: str) -> None:
         if self._task is not None and not self._task.done():
             return
-        self._task = asyncio.get_running_loop().create_task(self._reapply_later(reason, delay))
+        self._task = asyncio.get_running_loop().create_task(self._series(reason))
 
-    async def _reapply_later(self, reason: str, delay: float) -> None:
-        await asyncio.sleep(delay)
-        # Brightness 0 normally survives suspend, and a redundant write is not free:
-        # the driver lights the rings up for a moment before the new colour lands.
-        if self.is_applied():
-            decky.logger.info("[stick_lights] still off after %s, nothing to do", reason)
-            return
-        decky.logger.info("[stick_lights] re-applying after %s", reason)
+    def _write_off(self) -> bool:
+        """One cheap tick: every brightness write makes the driver recompute the
+        colours (stored blue x 0) and send black to the MCU."""
+        d = _led_dir()
+        if d is None:
+            return False
+        try:
+            write_str(os.path.join(d, "brightness"), "0")
+            return True
+        except OSError:
+            return False
+
+    async def _series(self, reason: str) -> None:
+        """The MCU comes back at an unpredictable moment after resume and lights
+        the rings as soon as the driver re-initialises it; keep writing so they go
+        dark again within one tick."""
+        loop = asyncio.get_running_loop()
         await self.reapply_if_enabled()
+        start = loop.time()
+        writes = 0
+        while loop.time() - start < SERIES_DENSE_S:
+            await asyncio.sleep(SERIES_TICK_S)
+            if not self.enabled:
+                return
+            writes += self._write_off()
+        for at in SERIES_TAIL_S:
+            await asyncio.sleep(max(0.0, start + at - loop.time()))
+            if not self.enabled:
+                return
+            writes += self._write_off()
+        await self.reapply_if_enabled()
+        decky.logger.info("[stick_lights] %s series: %d writes", reason, writes + 2)
         await self.notify()
