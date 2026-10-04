@@ -6,7 +6,8 @@ on SteamOS restores a previous setting. Writing brightness 0 through the LED
 class keeps the rings dark across suspend (unlike turning them "off" together
 with mcu_powersave, which lets the MCU reset them in sleep), so the fix writes
 a static blue at brightness 0 once when the plugin starts, and again when the
-LED device (re)appears. A single write after resume is a safety net.
+LED device (re)appears. After resume it only checks, and writes only if the
+rings are lit: a redundant write makes them flash.
 """
 
 from __future__ import annotations
@@ -110,6 +111,11 @@ class StickLightsFix(Fix):
 
     async def _reapply_later(self, reason: str, delay: float) -> None:
         await asyncio.sleep(delay)
+        # Brightness 0 normally survives suspend, and a redundant write is not free:
+        # the driver lights the rings up for a moment before the new colour lands.
+        if self.is_applied():
+            decky.logger.info("[stick_lights] still off after %s, nothing to do", reason)
+            return
         decky.logger.info("[stick_lights] re-applying after %s", reason)
         await self.reapply_if_enabled()
         await self.notify()
